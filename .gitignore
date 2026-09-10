@@ -1,1 +1,14 @@
+# Ignore the RE2-OB dataset
 data/RE2-OB.zip
+/data/
+
+
+# Ignore VENV 
+.venv/
+venv/
+env/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+.pytest_cache/
