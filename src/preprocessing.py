@@ -1,6 +1,7 @@
 from pathlib import Path
 import json
 import pandas as pd
+import argparse
 from collections import defaultdict, Counter
 
 
@@ -43,7 +44,7 @@ LABEL_POLICY = {
 
     #Kandidat target SLO dan Latency Treshold (bisa di ganti setelah konfirmasi nanti)
     "slo_target": 0.99, #99% SLO
-    "latency_threshold": 750.0, #Treshold dari latency (menentukan bahwa request itu buruk atau tidak)
+    "latency_threshold_ms": 750.0, #Treshold dari latency (menentukan bahwa request itu buruk atau tidak)
 
 
     #LOW : burn rate < 1
@@ -60,12 +61,12 @@ LABEL_POLICY = {
 }
 
 LABEL_SENSITIVITY = {
-    "slo_target": [
+    "slo_targets": [
         0.99,
         0.995,
         0.999,
     ],
-    "latenct_treshold_ms" : [
+    "latency_thresholds_ms" : [
         500.0,
         750.0,
         1000.0,
@@ -2418,40 +2419,976 @@ def validate_label_source_results(
     return True
 
 
-# #===================================#
-# # 6. DERIVED SEVERITY PROXY
-# #===================================#
+#===================================#
+# 6. DERIVED SEVERITY PROXY
+#===================================#
 
-# # 6.1 Label Policy Validation
-# def validate_label_policy(policy, sensitivity):
-#     #untuk memastikan konfigurasi slo, treshold latency dll valid dengan konfig di tahap 1
+# 6.1 Label Policy Validation
+def validate_label_policy(policy, sensitivity):
+    #untuk memastikan konfigurasi slo, treshold latency dll valid dengan konfig di tahap 1
 
-#     required_keys = {
-#         "policy_version",
-#         "is_frozen",
-#         "slo_target",
-#         "latency_treshold_ms",
-#         "medium_burn_rate",
-#         "high_burn_rate",
-#         "observation_window",
-#         "bad_request_rule",
-#     }
+    required_keys = {
+        "policy_version",
+        "is_frozen",
+        "slo_target",
+        "latency_threshold_ms",
+        "medium_burn_rate",
+        "high_burn_rate",
+        "observation_window",
+        "bad_request_rule",
+    }
 
-#     missing_keys = required_keys - set(policy)
+    missing_keys = required_keys - set(policy)
 
-#     if missing_keys:
-#         raise ValueError(
-#             "Konfigurasi label belum lengkap: "
-#             f"{sorted(missing_keys)}"
-#         )
+    if missing_keys:
+        raise ValueError(
+            "Konfigurasi label belum lengkap: "
+            f"{sorted(missing_keys)}"
+        )
 
-#     slo_target = float(policy["slo_target"])
-#     latency_treshold = float(policy["latency_treshold_ms"])
-#     medium_treshold = float(policy["medium_burn_rate"])
-#     high_treshold = float(policy["high_burn_rate"])
+    slo_target = float(policy["slo_target"])
+    latency_threshold = float(policy["latency_threshold_ms"])
+    medium_threshold = float(policy["medium_burn_rate"])
+    high_threshold = float(policy["high_burn_rate"])
 
+    if not 0 < slo_target < 1 :
+        raise ValueError(
+            "SLO target harus lebih besar dari 0 dan lebih kecil dari 1. "
+        )
+
+    if latency_threshold <= 0:
+        raise ValueError(
+            "Latency treshold harus leih besar dari 0 milidetik "
+        )
+
+    if medium_threshold <= 0:
+        raise ValueError(
+            "Medium burn rate treshold tidak boleh negatif "
+        )
+
+    if high_threshold <= medium_threshold:
+        raise ValueError(
+            "High burn rate treshold harus lebih besar dari medium treshold "
+        )
     
+    if not str(policy["policy_version"]).strip():
+        raise ValueError("Policy version tidak boleh kosong. ")
+
+    sensitivity_slos = sensitivity.get("slo_targets", [],)
+    sensitivity_latencies = sensitivity.get("latency_thresholds_ms", [],)
+
+    if not sensitivity_slos:
+        raise ValueError("Daftar sensitivity SLO tidak boleh kosong")
+
+    if not sensitivity_latencies:
+        raise ValueError("Daftar sensitivity latency treshold tidak boleh kosong")
+
+    if any(not 0 < float(value) < 1 for value in sensitivity_slos):
+        raise ValueError(
+            "Seluruh sensitivity SLO harus berada di antara 0 dan 1"
+        ) 
+
+    if any(float(value) <= 0 for value in sensitivity_latencies):
+        raise ValueError(
+            "Seluruh sensitivity latency treshold harus lebih besar dari 0"
+        )
+
+
+def _parse_required_boolean(series, column_name):
+    #Mengubah nilai TRUE/FALSE dari csv menjadi boolean serta menolak nilai yang tidak dikenal
+    #Menyelaraskan nilai boolean yang ada di dataset spt ("True", "False", " true ", "FALSE") menjadi booelan asli True/False 
+
+    normalized = (
+        series.astype("string").str.strip().str.lower()
+    )
+
+    invalid_mask = (normalized.isna() | ~normalized.isin(["true", "false"]))
+    if invalid_mask.any():
+        invalid_values = (series.loc[invalid_mask].drop_duplicates().head(10).tolist())
+
+        raise ValueError(
+            f"Nilai boolean tidak valid pada"
+            f"{column_name}: {invalid_values}"
+        )
+
+    return normalized.eq("true")
+
+
+def _threshold_token(threshold):
+    #membentuk treshold menjadi tokem aman untuk nama kolom
+    #contoh : 750.0 -> 750 , 728.336 -> 728p336
+
+    return format(float(threshold), ".12g").replace(".", "p",)
+
+def _get_all_label_thresholds(policy, sensitivity):
+    #Menggabungkan treshold utama dengan seluruh treshold sensitivity tanpa duplikasi
+
+    return sorted({
+        float(policy["latency_threshold_ms"]),
+        *(
+            float(value) for value in sensitivity["latency_thresholds_ms"]
+        ),
+    })
+
+def _get_all_slo_targets(policy, sensitivity):
+    #Menggabubgkan SLO utama dengan seluruh SLO sensitivity tanpa duplikasi
+    #Berfungsi ketika konfigurasi SLO diubah maka nanti akan tetap di simpan dalam Daftar SLO unik. gabungan dari treshold utama dan sensitivity
+    #Misal SLO utama 90, di sensitivity ada 95, maka hasilnya adalah [90, 95]
     
+    return sorted({
+        float(policy["slo_target"]),
+        *(
+            float(value) for value in sensitivity["slo_targets"]
+        ),
+    })
+
+
+
+#6.2 Label Source and Eligible Run Loading
+def load_label_source_eligibility(audit_path):
+    #Membaca hasil dari tahap 5.8 dan memisahkan run yang eligible dan yang tidak eligible
+
+    if not audit_path.exists():
+        raise FileNotFoundError(
+            "Label source audit belum tersedia: "
+            f"{audit_path}"
+        )
+
+    audit_report = pd.read_csv(audit_path, dtype={
+        "scenario": "string",
+        "service": "string",
+        "fault_type": "string",
+        "run_number": "string",
+        "execution_status": "string",
+        "quality_status": "string"
+    },)
+
+    required_columns = {
+        "scenario",
+        "service",
+        "fault_type",
+        "run_number",
+        "baseline_request_count",
+        "incident_request_count",
+        "label_source_eligible",
+        "quality_status",
+        "execution_status",
+    }
+
+    missing_columns = (required_columns - set(audit_report.columns))
+
+    if missing_columns:
+        raise ValueError(
+            "Kolom label source audit belum lengkap: "
+            f"{sorted(missing_columns)}"
+        )
+
+    duplicate_runs = audit_report.duplicated(["scenario", "run_number"], keep = False,)
+
+    if duplicate_runs.any():
+        raise ValueError(
+            "Ditemukan run duplikat pada label source audit. "
+        )
+
+    audit_report["label_source_eligible"] = _parse_required_boolean(
+        audit_report["label_source_eligible"],
+        "label_source_eligible",
+    )
+
+    execution_error = (audit_report["execution_status"].ne("valid"))
+
+    if execution_error.any():
+        error_rows= audit_report.loc[execution_error, [
+                "scenario",
+                "run_number",
+                "error_message"
+            ],
+        ]
+
+        print(error_rows.to_string(index=False))
+        raise RuntimeError("Terdapat run yang gagal pada hasil Fase 5 ")
+
+
+    eligible_runs = audit_report.loc[audit_report["label_source_eligible"],].copy()
+    excluded_runs = audit_report.loc[~audit_report["label_source_eligible"],].copy()
+
+    excluded_runs["exclusion_reason"] = excluded_runs["quality_status"].fillna("label_source_not_eligible")
+
+    if eligible_runs.empty:
+        raise RuntimeError(
+            "Tidak ada run yang eligible untuk pembuatan severity label "
+        )
+
+    return (
+        audit_report,
+        eligible_runs,
+        excluded_runs,
+    )
+
+
+#6.3 Chunked Request Classification and Aggregation
+def aggregate_label_source_requests(request_path, eligible_runs, latency_thresholds, chunksize=LABEL_AGGREGATION_CHUNK_SIZE,) :
+    #Fungsi ini membaca kandidat request secara chunk, lalu menghitung
+    #  - jumlah request
+    #  - jumlah request error
+    #  - jumlah request lambat
+    #  - jumlah request error dan lambat
+    #  - jumlah bad request berdasarkan union
+
+    if not request_path.exists():
+        raise FileNotFoundError(
+            "Request candidate belum tersedia: "
+            f"{request_path}"
+        )
+
+    key_columns = ["scenario", "run_number"]
+    eligible_keys = (eligible_runs[key_columns].drop_duplicates())
+    thresholds = sorted({
+        float(value) for value in latency_thresholds
+    })
+
+    count_columns = ["n_total", "n_error",]
+
+    for threshold in thresholds:
+        token = _threshold_token(threshold)
+
+        count_columns.extend([
+            f"n_slow_gt_{token}ms",
+            f"n_error_and_slow_gt_{token}ms",
+            f"n_bad_at_{token}ms",
+        ])
+
+    partial_reports = []
+    baseline_duration_parts = []
+
+    use_columns = [
+        "scenario",
+        "run_number",
+        "window_type",
+        "duration_ms",
+        "has_nonzero_status",
+    ]
+
+    reader = pd.read_csv(
+        request_path, 
+        usecols=use_columns, 
+        dtype={
+            "scenario": "string",
+            "run_number": "string",
+            "window_type": "string",
+            "duration_ms": "float64",
+            "has_nonzero_status": "boolean",
+        },
+        chunksize=chunksize,
+    )
+
+    for chunk_number, chunk in enumerate(reader, start=1):
+        #Menghapus request dari run ineligible
+        chunk = chunk.merge(eligible_keys, on=key_columns, how="inner", validate= "many_to_one",)
+
+        if chunk.empty:
+            continue
+
+        invalid_window = ~chunk["window_type"].isin(["baseline", "incident",])
+
+        if invalid_window.any():
+            raise ValueError(
+                "Terdapat window type yang tidak dikenal "
+                f"pada chunk {chunk_number}."
+            )
+
+        invalid_duration = (
+            chunk["duration_ms"].isna() | chunk["duration_ms"].lt(0) | chunk["duration_ms"].eq(-float("inf"))
+        )
+
+        if invalid_duration.any():
+            raise ValueError(
+                "Terdapat duration yang tidak valid "
+                f"pada chunk {chunk_number}."
+            )
+
+        chunk["is_error"] = (_parse_required_boolean(chunk["has_nonzero_status"], "has_nonzero_status"))
+
+        baseline_chunk = chunk.loc[
+            chunk["window_type"].eq("baseline"), "duration_ms"
+        ]
+
+        if not baseline_chunk.empty:
+            baseline_duration_parts.append(
+                baseline_chunk.reset_index(drop=True)
+            )
+
+        incident_chunk = chunk.loc[
+            chunk["window_type"].eq("incident")
+        ].copy()
+
+        if incident_chunk.empty:
+            continue
+
+        incident_chunk["n_total"] = 1
+        incident_chunk["n_error"] = (incident_chunk["is_error"].astype("int64"))
+
+        for threshold in thresholds:
+            token = _threshold_token(threshold)
+
+            is_slow = (incident_chunk["duration_ms"].gt(threshold))
+            is_error_and_slow = (incident_chunk["is_error"] & is_slow)
+            is_bad = (incident_chunk["is_error"] | is_slow)
+
+            incident_chunk[
+                f"n_slow_gt_{token}ms"
+            ] = is_slow.astype("int64")
+
+            incident_chunk[
+                f"n_error_and_slow_gt_{token}ms"
+            ] = is_error_and_slow.astype("int64")
+
+            incident_chunk[
+                f"n_bad_at_{token}ms"
+            ] = is_bad.astype("int64")
+
+
+        partial_report = (
+            incident_chunk.groupby(key_columns, as_index=False, sort=False)[count_columns].sum()
+        )
+
+        partial_reports.append(partial_report)
+
+        print(
+            f"[PHASE 6] Request chunk "
+            f"{chunk_number} selesai"
+        )
+
+    if not partial_reports:
+        raise RuntimeError(
+            "Tidak ada incident request pada run eligible "
+        )
+
+    incident_counts = (
+        pd.concat(partial_reports, ignore_index=True, ).groupby(key_columns, as_index=False, sort=False)[count_columns].sum()
+    )
+
+    run_metadata = eligible_runs[
+        [
+            "scenario",
+            "service",
+            "fault_type",
+            "run_number",
+            "baseline_request_count",
+            "incident_request_count",
+        ]
+    ].copy()
+
+
+    incident_counts = run_metadata.merge(
+        incident_counts, on= key_columns, how="left", validate="one_to_one"
+    )
+
+    if incident_counts[
+        count_columns
+    ].isna().any().any():
+        raise ValueError(
+            "Ada run eligible yang tidak memiliki hasil aggregasi incident request. "
+        )
+
+    incident_counts[
+        count_columns
+    ] = incident_counts[
+        count_columns
+    ].astype("int64")
+
+    expected_incident_count = pd.to_numeric(
+        incident_counts[
+            "incident_request_count"
+        ],
+        errors="raise",
+    ).astype("int64")
+
+    incident_count_mismatch = (
+        incident_counts["n_total"].ne(expected_incident_count)
+    )
+
+    if incident_count_mismatch.any():
+        mismatch_rows = incident_counts.loc[
+            incident_count_mismatch, 
+            [
+                "scenario",
+                "run_number",
+                "incident_request_count",
+                "n_total",
+            ],
+        ]
+        
+        print(mismatch_rows.to_string(index=False))
+
+        raise RuntimeError(
+            "Jumlah incident request tidak konsisten "
+            "dengan hasil Tahapan 5 "  
+        )
+
+    if not baseline_duration_parts:
+        raise RuntimeError(
+            "Tidak ditemukan baseline request pada run eligible "
+        )
+
+    baseline_durations = pd.concat(baseline_duration_parts, ignore_index=True, )
+
+    expected_baseline_count = int(
+        pd.to_numeric(
+            eligible_runs[
+                "baseline_request_count"
+            ],
+            errors="raise",
+        ).sum()
+    )
+
+    if len(baseline_durations) != expected_baseline_count:
+        raise RuntimeError(
+            "Jumlah baseine request tidak konsisten dengan hasil tahapan 5"
+        )
+
+    calibration_record = {
+        "eligible_run_count": len(eligible_runs),
+        "baseline_request_count": len(baseline_durations),
+        "latency_ms_mean": float(baseline_durations.mean()),
+        "latency_ms_p50": float(baseline_durations.quantile(0.50)),
+        "latency_ms_p90": float(baseline_durations.quantile(0.90)),
+        "latency_ms_p95": float(baseline_durations.quantile(0.95)),
+        "latency_ms_p97_5": float(baseline_durations.quantile(0.975)),
+        "latency_ms_p99": float(baseline_durations.quantile(0.99)),
+        "latency_ms_max": float(baseline_durations.max()),
+    }
+
+    for threshold in thresholds: 
+        token = _threshold_token(threshold)
+
+        slow_count = int(baseline_durations.gt(threshold).sum())
+        calibration_record[f"slow_count_gt_{token}ms"] = slow_count
+        calibration_record[f"slow_rate_gt_{token}ms"] = (
+            slow_count / len(baseline_durations)
+        )
+
+    baseline_calibration = pd.DataFrame([calibration_record])
+
+    return (
+        incident_counts, baseline_calibration
+    )
+
+
+#6.4 Burn Rate and Derived Severity Calculation
+def classify_burn_rate(burn_rate, policy):
+
+    #Mengubah burn rate menjadi kategori low, medium, atau high
+    #LOW    : burn Rate < Medium Treshold
+    #MEDIUM : medium <= burn rate < high treshold
+    #HIGH   : burn rate >= high treshold
+
+    return pd.cut(burn_rate,bins=[
+            -float("inf"),
+            float(
+                policy["medium_burn_rate"]
+            ),
+            float(
+                policy["high_burn_rate"]
+            ),
+            float("inf"),
+        ],
+        labels=[
+            "Low",
+            "Medium",
+            "High"
+        ],
+        right=False
+    ).astype("string")
+
+
+def build_derived_severity_labels(incident_counts, policy):
+    #Menghasilkan satu derived severity proxy untuk setiap run eligible
+
+    latency_threshold = float(policy["latency_threshold_ms"])
+    slo_target = float(policy["slo_target"])
+    token = _threshold_token(latency_threshold)
+
+    slow_column = (f"n_slow_gt_{token}ms")
+    overlap_column = (f"n_error_and_slow_gt_{token}ms")
+    bad_column = (f"n_bad_at_{token}ms")
+
+    required_columns = {
+        slow_column, 
+        overlap_column,
+        bad_column,
+    }
+
+    missing_columns = (required_columns - set(incident_counts.columns))
+
+    if missing_columns:
+        raise ValueError(
+            "Hasil agregasi belum memiliki"
+            f"treshold {latency_threshold}ms. "
+        )
+
+    labels = incident_counts[
+        [
+            "scenario",
+            "service",
+            "fault_type",
+            "run_number",
+            "n_total",
+            "n_error",
+            slow_column,
+            overlap_column,
+            bad_column,
+        ]
+    ].copy()
+
+    labels = labels.rename(
+        columns = {
+            slow_column: "n_slow",
+            overlap_column: ("n_error_and_slow"),
+            bad_column: "n_bad",
+        }
+    )
+
+    #Memvalidasikan aturan union
+    #Error or Slow 
+    
+    expected_n_bad = (labels["n_error"] + labels["n_slow"] - labels["n_error_and_slow"])
+
+    if not labels["n_bad"].eq(expected_n_bad).all():
+        raise RuntimeError(
+            "Perhitungan union bad request tidak konsisten "
+        )   
+
+    labels.insert(
+        0,
+        "case_id",
+        (
+            labels["scenario"] + "-" + labels["run_number"]
+        ),
+    )
+
+    labels["n_good"] = (labels["n_total"] - labels["n_bad"])
+    labels["bad_rate"] = (labels["n_bad"] / labels["n_total"])
+    labels["good_rate"] = (labels["n_good"] / labels["n_total"])
+    labels["slo_target"] = slo_target
+    labels["error_budget_rate"] = ( 1.0 - slo_target)
+
+    labels["latency_threshold_ms"] = latency_threshold
+    labels["burn_rate"] = (labels["bad_rate"] / labels["error_budget_rate"])
+    labels["severity"] = classify_burn_rate(labels["burn_rate"], policy)
+
+    labels["label_policy_version"] = policy["policy_version"]
+    labels["label_status"] = ("final" if policy["is_frozen"] else "candidate")
+    labels["bad_request_rule"] = (policy["bad_request_rule"])
+
+    return labels[
+        [
+            "case_id",
+            "scenario",
+            "service",
+            "fault_type",
+            "run_number",
+            "n_total",
+            "n_good",
+            "n_bad",
+            "n_error",
+            "n_slow",
+            "n_error_and_slow",
+            "good_rate",
+            "bad_rate",
+            "slo_target",
+            "error_budget_rate",
+            "latency_threshold_ms",
+            "burn_rate",
+            "severity",
+            "label_policy_version",
+            "label_status",
+            "bad_request_rule",
+        ]
+    ]
+
+
+#6.5 Sensitivity Analysis
+def build_label_sensitivity_reports(incident_counts, policy, sensitivity):
+    #Berfungsi untuk menghitung ulang label dengan beberapa kombinasi SLO dan latency treshold tanpa membaca ulang FILE CSV
+
+    thresholds = (_get_all_label_thresholds(policy, sensitivity))
+    slo_targets = (_get_all_slo_targets(policy, sensitivity))
+
+    detail_reports = []
+    summary_records = []
+
+    base_columns = [
+        "scenario",
+        "service",
+        "fault_type",
+        "run_number",
+        "n_total",
+    ]
+
+    for threshold in thresholds:
+        token = _threshold_token(threshold)
+        bad_column = (f"n_bad_at_{token}ms")
+
+        for slo_target in slo_targets:
+            
+            detail = incident_counts[base_columns].copy()
+            detail.insert(0, "case_id", (detail["scenario"] + "-" + detail["run_number"]),)
+            detail["n_bad"] = (incident_counts[bad_column])
+            detail["bad_rate"] = (detail["n_bad"] / detail["n_total"]) #-> rumus bad rate
+            detail["slo_target"] = slo_target
+            detail["latency_threshold_ms"] = threshold
+            detail["burn_rate"] = (detail["bad_rate"] / (1.0 - slo_target)) #-> rumus burn rate
+            detail["severity"] = (classify_burn_rate(detail["burn_rate"],policy, ))
+
+            detail_reports.append(detail)
+
+            summary_records.append({
+                "slo_target": slo_target,
+                "latency_threshold_ms": threshold,
+                "run_count": len(detail),
+                "low_count": int(detail["severity"].eq("Low").sum()),
+                "medium_count": int(detail["severity"].eq("Medium").sum()),
+                "high_count": int(detail["severity"].eq("High").sum()),
+                "burn_rate_min": float(detail["burn_rate"].min()),
+                "burn_rate_median": float(detail["burn_rate"].median()),
+                "burn_rate_max": float(detail["burn_rate"].max()),
+            })
+
+    sensitivity_detail = pd.concat(detail_reports, ignore_index=True)
+    sensitivity_summary = pd.DataFrame(summary_records)
+
+    return (sensitivity_detail, sensitivity_summary)
+
+
+#6.6 Derived Label Validation and persistance
+def validate_derived_severity_labels(labels, eligible_runs, policy):
+    #Berfungsi untuk memastikan output label lengkap, unik, konsisten ,dan hanya berisi run yg eligible
+
+    if len(labels) != len(eligible_runs):
+        raise RuntimeError("Jumlah derived label tidak sama dengan jumlah run eligible")
+
+    if labels["case_id"].duplicated().any():
+        raise RuntimeError(
+            "Ditemukan Case Id yang duplikat pada derived label"
+        )
+    
+    required_columns = [
+        "case_id",
+        "n_total",
+        "n_good",
+        "n_bad",
+        "n_error",
+        "n_slow",
+        "bad_rate",
+        "burn_rate",
+        "severity",
+    ]
+
+    if labels[required_columns].isna().any().any():
+        raise RuntimeError(
+            "Derived label masih memiliki nilai kosong"
+        )
+
+    if labels["n_total"].le(0).any():
+        raise RuntimeError(
+            "Ditemukan run tanpa incident request. "
+        )
+
+    invalid_bad_count = (labels["n_bad"].lt(0) | labels["n_bad"].gt(labels["n_total"]))
+
+    if invalid_bad_count.any():
+        raise RuntimeError(
+            "Jumlah bad request melebihi rentang yang valid"
+        )
+
+    if not(labels["n_good"] + labels["n_bad"]).eq(labels["n_total"]).all():
+        raise RuntimeError(
+            "n_good + n_bad tidak sama dengan n_total"
+        )
+
+    valid_severities = {
+        "Low", "Medium", "High",
+    }
+
+    if not set(labels["severity"].dropna()).issubset(valid_severities):
+        raise RuntimeError(
+            "Ditemukan severity yang tidak valid"
+        )
+
+    expected_severity = (classify_burn_rate(labels["burn_rate"], policy))
+
+    if not labels["severity"].eq(expected_severity).all():
+        raise RuntimeError(
+            "Severity tidak konsisten dengan burn rate. "
+        )
+
+    label_keys = set(
+        zip(labels["scenario"], labels["run_number"],)
+    )
+
+    eligible_keys = set(
+        zip(eligible_runs["scenario"], eligible_runs["run_number"],)
+    )
+
+    if label_keys != eligible_keys: 
+        raise RuntimeError(
+            "Run pada derived label tidak sama "
+            "dengan daftar run eligible. "
+        )
+
+    return True
+
+
+def save_label_policy_document(policy, sensitivity, policy_path, eligible_run_count, excluded_run_count, output_files):
+    #......................
+
+    policy_document = {
+        "phase": (
+            "6 - Derived Severity Proxy"
+        ),
+        "generated_at_utc": (
+            pd.Timestamp.now(
+                tz="UTC"
+            ).isoformat()
+        ),
+        "policy": policy,
+        "sensitivity_analysis": sensitivity,
+        "eligible_run_count": int(eligible_run_count),
+        "excluded_run_count": int(excluded_run_count),
+        "input_files": {
+            "eligibility_audit": ("trace_label_source_audit_report.csv"),
+            "request_candidates": ("label_source_request_candidates.csv"),
+        },
+        "output_files": output_files,
+        "method_note": (
+            "severity adalah derived proxy dari "
+            "short window error budget burn rate. "
+            "bukan severity ground truth produksi"
+        )
+    }
+
+    with policy_path.open("w", encoding="utf-8") as file:
+        json.dump(
+            policy_document,
+            file,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+
+def run_phase_6():
+    #Orkestrator phase 6 untuk menjalankannya
+
+    print(
+        "\n[Pipeline] Memulai Fase 6: "
+        "Derived Severity Proxy..."
+    )
+
+    validate_label_policy(LABEL_POLICY, LABEL_SENSITIVITY,)
+
+    OUTPUT_ROOT.mkdir(
+        parents= True,
+        exist_ok = True,
+    )
+
+    audit_path = (OUTPUT_ROOT / "trace_label_source_audit_report.csv")
+    request_path = (OUTPUT_ROOT / "label_source_request_candidates.csv")
+
+    (
+        _,
+        eligible_runs,
+        excluded_runs,
+    ) = load_label_source_eligibility(audit_path)
+
+    latency_thresholds = (
+        _get_all_label_thresholds(LABEL_POLICY, LABEL_SENSITIVITY,)
+    )
+
+    (
+        incident_counts,
+        baseline_calibration,
+    ) = aggregate_label_source_requests(request_path=request_path,eligible_runs=eligible_runs,latency_thresholds=latency_thresholds,)
+
+    labels = build_derived_severity_labels(
+        incident_counts,
+        LABEL_POLICY,
+    )
+
+    (
+        sensitivity_detail,
+        sensitivity_summary,
+    ) = build_label_sensitivity_reports(incident_counts,LABEL_POLICY,LABEL_SENSITIVITY,)
+
+    validate_derived_severity_labels(labels,eligible_runs,LABEL_POLICY,)
+
+    policy_version = str(LABEL_POLICY["policy_version"])
+
+    if LABEL_POLICY["is_frozen"]:
+        label_filename = ("derived_severity_labels.csv")
+        policy_filename = ("label_policy.json")
+    else:
+        label_filename = (
+            "derived_severity_label_"
+            f"{policy_version}.csv"
+        )
+        policy_filename = (
+            "label_policy_"
+            f"{policy_version}.json"
+        )
+
+    label_path = (OUTPUT_ROOT / label_filename)
+    calibration_path = (OUTPUT_ROOT / "baseline_latency_calibration.csv")
+    sensitivity_detail_path = (
+        OUTPUT_ROOT
+        / (
+            "derived_severity_sensitivity_"
+            f"by_run_{policy_version}.csv"
+        )
+    )
+
+    sensitivity_summary_path = (
+        OUTPUT_ROOT
+        / (
+            "derived_severity_sensitivity_"
+            f"summary_{policy_version}.csv"
+        )
+    )
+
+    excluded_path = (OUTPUT_ROOT / "derived_severity_excluded_runs.csv")
+    policy_path = (OUTPUT_ROOT / policy_filename)
+
+    labels.to_csv(label_path,index=False,)
+    baseline_calibration.to_csv(calibration_path,index=False,)
+    sensitivity_detail.to_csv(sensitivity_detail_path,index=False,)
+    sensitivity_summary.to_csv(sensitivity_summary_path,index=False,)
+    excluded_runs.to_csv(excluded_path,index=False,)
+
+    output_files = {
+        "derived_labels": label_path.name,
+        "baseline_calibration": (calibration_path.name),
+        "sensitivity_by_run": (sensitivity_detail_path.name),
+        "sensitivity_summary": (sensitivity_summary_path.name),
+        "excluded_runs": excluded_path.name,
+    }
+
+    save_label_policy_document(
+        policy=LABEL_POLICY,
+        sensitivity=LABEL_SENSITIVITY,
+        policy_path=policy_path,
+        eligible_run_count=len(eligible_runs),
+        excluded_run_count=len(excluded_runs),
+        output_files=output_files,
+    )
+
+    print(
+        "\n========== PHASE 6 SUMMARY =========="
+    )
+
+    print(
+        "Policy version:",
+        LABEL_POLICY["policy_version"],
+    )
+
+    print(
+        "Policy status:",
+        (
+            "FINAL"
+            if LABEL_POLICY["is_frozen"]
+            else "CANDIDATE"
+        ),
+    )
+
+    print(
+        "SLO target:",
+        LABEL_POLICY["slo_target"],
+    )
+
+    print(
+        "Latency threshold:",
+        LABEL_POLICY[
+            "latency_threshold_ms"
+        ],
+        "ms",
+    )
+
+    print(
+        "Eligible run:",
+        len(eligible_runs),
+    )
+
+    print(
+        "Excluded run:",
+        len(excluded_runs),
+    )
+
+    print(
+        "Baseline latency P99:",
+        baseline_calibration.loc[
+            0,
+            "latency_ms_p99",
+        ],
+        "ms",
+    )
+
+    print(
+        "\nDistribusi severity:"
+    )
+
+    print(
+        labels["severity"]
+        .value_counts()
+        .reindex(
+            [
+                "Low",
+                "Medium",
+                "High",
+            ],
+            fill_value=0,
+        )
+    )
+
+    print(
+        "\nDerived label disimpan di:",
+        label_path,
+    )
+
+    print(
+        "Label policy disimpan di:",
+        policy_path,
+    )
+
+    print(
+        "Sensitivity summary disimpan di:",
+        sensitivity_summary_path,
+    )
+
+    print(
+        "[OK] Fase 6 selesai"
+    )
+
+    return {
+        "labels": labels,
+        "eligible_runs": eligible_runs,
+        "excluded_runs": excluded_runs,
+        "baseline_calibration": (
+            baseline_calibration
+        ),
+        "sensitivity_detail": (
+            sensitivity_detail
+        ),
+        "sensitivity_summary": (
+            sensitivity_summary
+        ),
+    }
+
+
+
+        
+
+
+     
+
 
 
 #===================================#
@@ -3288,6 +4225,41 @@ def main():
         "konsisten dengan Fase 5.2"
     )
 
+def parse_execution_arguments():
+    """
+    --phase all : menjalankan seluruh pipeline
+    --phase 6   : hanya menjalankan Derived Severity
+                  dari output Fase 5 yang sudah tersimpan
+    """
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "RE2-OB preprocessing pipeline"
+        )
+    )
+
+    parser.add_argument(
+        "--phase",
+        choices=[
+            "all",
+            "6",
+        ],
+        default="all",
+        help=(
+            "Gunakan '6' untuk menjalankan "
+            "Derived Severity saja."
+        ),
+    )
+
+    return parser.parse_args()
+
 
 if __name__ == "__main__":
-    main()
+    arguments = (
+        parse_execution_arguments()
+    )
+
+    if arguments.phase == "6":
+        run_phase_6()
+    else:
+        main()
