@@ -3,6 +3,9 @@ import json
 import pandas as pd
 import argparse
 import re
+import hashlib
+import sys
+import sklearn
 from collections import defaultdict, Counter
 from sklearn.metrics import balanced_accuracy_score
 from sklearn.tree import DecisionTreeClassifier
@@ -264,6 +267,35 @@ CASE_METADATA_COLUMNS = ["case_id", "scenario", "service", "fault_type", "run_nu
 
 
 
+#============ READINESS CONFIG (FASE 11) ===============#
+
+# Tujuh file yang wajib ada di folder training; semuanya diberi sidik jari (md5)
+TRAINING_FILES = (
+    "features_E0.csv", "features_E1.csv", "features_E2.csv", "features_E3.csv",
+    "derived_severity_labels.csv", "case_metadata.csv", "config_definition.json",
+)
+
+# Kolom di file label yang merupakan bahan pembentuk severity.
+# Fase 11 memastikan tidak ada kolom fitur yang nilainya persis sama dengan salah satunya.
+LABEL_INGREDIENT_COLUMNS = ("fcw", "sct", "severity_score")
+
+# Daftar file/folder yang memang dihasilkan kode saat ini di data/processed.
+# Apa pun di luar daftar ini (dan file Fase 6 yang namanya bergantung versi)
+# dilaporkan sebagai "tidak dikenal" - biasanya sisa dari kode versi lama.
+EXPECTED_PROCESSED_ENTRIES = (
+    "timeseries_quality_report.csv", "missing_by_column_report.csv",
+    "raw_trace_structure_report.csv", "root_span_identity_report.csv",
+    "root_service_operation_report.csv", "span_status_code_report.csv",
+    "alignment_excluded_runs.csv", "aligned_timeseries_manifest.csv",
+    "alignment_quality_report.csv", "alignment_config.json", "aligned_timeseries",
+    "feature_column_schema.csv", "feature_eligibility.csv", "cleaning_log.csv",
+    "column_harmonization_map.csv", "log_template_catalog.csv",
+    "cleaned_timeseries_manifest.csv", "cleaning_config.json", "cleaned_timeseries",
+    "features_by_case.csv", "feature_manifest.csv", "feature_extraction_report.json",
+    "service_call_graph.csv", "service_call_volume_by_case.csv",
+    "service_context_proxy_audit.csv", "training",
+    "preprocessing_readiness_report.json", "leakage_audit.json",
+)
 
 
 
@@ -4606,10 +4638,596 @@ def run_phase_9():
 # 10. FINAL DATASET ASSEMBLY
 #===================================#
 
+#10.1 Memuat output fase 6,8, dan 9
+def resolve_label_path():
+    # Tugas: menentukan nama file label yang ditulis Fase 6.
+    # Fase 6 memberi akhiran versi selama policy masih "candidate"
+    # (derived_severity_labels_fcw_sct_v1.csv) dan tanpa akhiran setelah dikunci.
+    # Aturan yang sama diulang di sini supaya keduanya selalu sepakat.
+
+    version = str(LABEL_POLICY["policy_version"])
+    suffix = "" if LABEL_POLICY["is_frozen"] else f"_{version}"
+    return OUTPUT_ROOT / f"derived_severity_labels{suffix}.csv"
+
+
+def load_assembly_inputs():
+    # Tugas: membaca empat file masukan dan berhenti dengan pesan jelas jika ada yang belum ada.
+    #   features_by_case.csv           -> tabel fitur (Fase 9)
+    #   feature_manifest.csv           -> kamus fitur, penentu E0-E3 (Fase 9)
+    #   derived_severity_labels_*.csv  -> label (Fase 6)
+    #   cleaned_timeseries_manifest.csv-> identitas run (Fase 8)
+
+    paths = {
+        "features": OUTPUT_ROOT / "features_by_case.csv",
+        "manifest": OUTPUT_ROOT / "feature_manifest.csv",
+        "labels": resolve_label_path(),
+        "cleaned_manifest": OUTPUT_ROOT / "cleaned_timeseries_manifest.csv",
+    }
+    for name, path in paths.items():
+        if not path.exists():
+            raise FileNotFoundError(f"Masukan Fase 10 ({name}) belum tersedia: {path}")
+
+    features = pd.read_csv(paths["features"])
+    manifest = pd.read_csv(paths["manifest"])
+    labels = pd.read_csv(paths["labels"], dtype={"run_number": "string"})
+    cleaned_manifest = pd.read_csv(paths["cleaned_manifest"], dtype={"run_number": "string"})
+    return features, manifest, labels, cleaned_manifest
+
+
+
+
+#10.2 Metadata Run
+def build_case_metadata(cleaned_manifest, case_ids):
+    # Tugas: membuat tabel identitas, satu baris per run, dengan urutan baris
+    # persis sama seperti tabel fitur. Kolom scenario nanti menjadi "group"
+    # pada cross-validation supaya tiga repetisi satu scenario tidak terpisah.
+
+    metadata = cleaned_manifest[CASE_METADATA_COLUMNS].set_index("case_id")
+    return metadata.loc[case_ids].reset_index()
+
+
+
+#10.3 Penyelarasan Label
+def align_labels(labels, case_ids):
+    # Tugas: mengambil label untuk setiap run yang punya fitur, dalam urutan yang sama.
+    # Dua aturan:
+    #   - setiap run berfitur WAJIB punya label -> jika tidak, berhenti (error)
+    #   - label tanpa fitur (run yang gugur di Fase 7) BOLEH ada -> dicatat, bukan error
+    # Penggabungan selalu lewat case_id, tidak pernah lewat urutan baris.
+
+    label_index = labels.set_index("case_id")
+
+    missing = [case_id for case_id in case_ids if case_id not in label_index.index]
+    if missing:
+        raise RuntimeError(f"Run berikut punya fitur tetapi tidak punya label: {missing[:5]}")
+
+    without_features = sorted(set(label_index.index) - set(case_ids))
+    aligned = label_index.loc[case_ids].reset_index()
+    return aligned, without_features
+
+
+#10.4 Pemilihan Kolom per Konfigurasi
+def select_features(features, manifest, config):
+    # Tugas: mengambil kolom fitur yang boleh dilihat model pada konfigurasi tertentu.
+    # Konfigurasi bersifat bertingkat: E2 = kolom E0 + E1 + E2. Daftar kolom diambil
+    # dari manifest (kolom "config"), bukan dari tebakan awalan nama, dan kolom yang
+    # ditolak audit tidak pernah ikut walaupun ada di tabel fitur.
+
+
+    allowed = CONFIG_ORDER[: CONFIG_ORDER.index(config) + 1]
+    selected = manifest.loc[
+        manifest["config"].isin(allowed) & manifest["audit_status"]
+        .ne("rejected"), "feature_name",
+    ].tolist()
+    return features[["case_id"] + selected]
+
+
+
+#10.5 Penulisan Enam File Training
+def write_training_dataset(features, manifest, labels, metadata):
+    # Tugas: menulis empat file fitur, satu file label, dan satu file metadata ke
+    # folder training. Mengembalikan ringkasan (nama file dan jumlah fitur) per konfigurasi.
+
+    TRAINING_DATASET_ROOT.mkdir(parents=True, exist_ok = True)
+    written = {}
+
+    for config in CONFIG_ORDER:
+        frame = select_features(features, manifest, config)
+        path = TRAINING_DATASET_ROOT / f"features_{config}.csv"
+        frame.to_csv(path, index=False)
+        written[config] = {"file": path.name, "feature_count": int(frame.shape[1] - 1)}
+
+    labels.to_csv(TRAINING_DATASET_ROOT / "derived_severity_labels.csv", index=False)
+    metadata.to_csv(TRAINING_DATASET_ROOT / "case_metadata.csv", index=False)
+    return written
+
+
+
+#10.6 Pemeriksaan Keterpaduan X-y
+def validate_training_dataset(case_ids, labels, metadata):
+    # Tugas: memeriksa file yang SUDAH TERTULIS di disk (bukan variabel di memori),
+    # karena itulah yang akan dibaca classifier.py. Lima pemeriksaan:
+    #   1. case_id unik, dan urutannya identik di fitur, label, dan metadata
+    #   2. label hanya berisi Low / Medium / High
+    #   3. tiap file E memuat semua kolom file E sebelumnya (bertingkat)
+    #   4. tidak ada kolom terlarang di file fitur mana pun
+    #   5. semua kolom fitur berupa angka
+
+    
+    if len(set(case_ids)) != len(case_ids):
+        raise RuntimeError("Ditemukan case_id duplikat")
+    if labels["case_id"].tolist() != case_ids:
+        raise RuntimeError("Urutan atau isi case_id pada label tidak sama dengan fitur")
+    if metadata["case_id"].tolist() != case_ids:
+        raise RuntimeError("Urutan atau isi case_id pada metadata tidak sama dengan fitur")
+    if not set(labels["severity"]).issubset(SEVERITY_ORDER):
+        raise RuntimeError("Label memuat kelas severity yang tidak dikenal")
+
+    
+    previous_columns = set()
+    for config in CONFIG_ORDER:
+        frame = pd.read_csv(TRAINING_DATASET_ROOT / f"features_{config}.csv")
+
+        if frame["case_id"].tolist() != case_ids:
+            raise RuntimeError(f"features_{config}.csv: urutan case_id tidak sama dengan label")
+
+        columns = set(frame.columns) - {"case_id"}
+        if not previous_columns.issubset(columns):
+            raise RuntimeError(f"features_{config}.csv tidak memuat seluruh kolom konfigurasi sebelumnya")
+
+        forbidden = [c for c in FORBIDDEN_FEATURE_COLUMNS if c in frame.columns]
+        if forbidden:
+            raise RuntimeError(f"features_{config}.csv memuat kolom terlarang: {forbidden}")
+
+        non_numeric = frame.drop(columns=["case_id"]).select_dtypes(exclude="number").columns.tolist()
+        if non_numeric:
+            raise RuntimeError(f"features_{config}.csv memuat kolom non-numerik: {non_numeric[:5]}")
+
+        previous_columns = columns
+    
+    return True
+
+
+#10.7 Dokumen Definisi Konfigurasi
+def save_config_definition(written, labels, metadata, labels_without_features):
+    # Tugas: menulis satu file JSON yang menjelaskan isi folder training:
+    # berapa baris, versi label, sebaran kelas, modality tiap konfigurasi, jumlah fitur,
+    # dan run mana yang punya label tetapi tidak punya fitur. Ini sumber angka untuk
+    # tabel "konfigurasi x jumlah fitur" di Bab 4.
+
+    def modalities_for(config):
+        limit = CONFIG_ORDER.index(config)
+        return [m for m, cfg in MODALITY_CONFIG.items() if CONFIG_ORDER.index(cfg) <= limit]
+
+    distribution = labels["severity"].value_counts().reindex(SEVERITY_ORDER, fill_value=0)
+
+    definition = {
+        "generated_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
+        "row_count": int(len(labels)),
+        "label_policy_version": str(LABEL_POLICY["policy_version"]),
+        "label_status": "final" if LABEL_POLICY["is_frozen"] else "candidate",
+        "severity_distribution": {k: int(v) for k, v in distribution.items()},
+        "group_column": "scenario",
+        "group_count": int(metadata["scenario"].nunique()),
+        "configurations": {
+            config: {"modalities": modalities_for(config), **written[config]}
+            for config in CONFIG_ORDER
+        },
+        "labels_without_features": labels_without_features,
+        "files": {
+            "labels": "derived_severity_labels.csv",
+            "metadata": "case_metadata.csv",
+            "target_column": "severity",
+        },
+    }
+
+    with (TRAINING_DATASET_ROOT / "config_definition.json").open("w", encoding="utf-8") as file:
+        json.dump(definition, file, ensure_ascii=False, indent=2)
+    return definition
+
+
+#10.8 Phase 10 Orchestrator
+def run_phase_10():
+    # Tugas: menjalankan seluruh Fase 10 berurutan.
+    #   1. Baca fitur, manifest, label, metadata.
+    #   2. Urutkan run berdasarkan case_id supaya urutan tetap dan sama di semua file.
+    #   3. Selaraskan label dan metadata ke urutan itu.
+    #   4. Tulis enam file training.
+    #   5. Periksa ulang file yang tertulis, lalu simpan definisi konfigurasi.
+
+    print("\n[Pipeline] Memulai Fase 10: Final dataset assembly...")
+
+    features, manifest, labels, cleaned_manifest = load_assembly_inputs()
+
+    features = features.sort_values("case_id").reset_index(drop=True)
+    case_ids = features["case_id"].tolist()
+
+    labels_aligned, labels_without_features = align_labels(labels, case_ids)
+    metadata = build_case_metadata(cleaned_manifest, case_ids)
+
+    written = write_training_dataset(features, manifest, labels_aligned, metadata)
+    validate_training_dataset(case_ids, labels_aligned, metadata)
+    definition = save_config_definition(written, labels_aligned, metadata, labels_without_features)
+
+    print("\n========== PHASE 10 SUMMARY ==========")
+    print("Run (baris)             :", definition["row_count"])
+    print("Label tanpa fitur       :", len(labels_without_features), labels_without_features)
+    print("Versi label             :", definition["label_policy_version"],
+          f"({definition['label_status']})")
+    print("Distribusi severity     :", definition["severity_distribution"])
+    print("Group CV (scenario)     :", definition["group_count"])
+    print("\nFitur per konfigurasi (kumulatif):")
+    for config in CONFIG_ORDER:
+        info = definition["configurations"][config]
+        print(f"  {config}: {info['feature_count']:4d} fitur  <- {', '.join(info['modalities'])}")
+    print("\nFolder training         :", TRAINING_DATASET_ROOT)
+    print("[OK] Fase 10 selesai")
+
+    return definition
+
+
+
+#===================================#
+# 11. FINAL VALIDATION AND HANDOFF
+#===================================#
+
+#11.1 Memuat dan Memeriksa Skema Dataset Training
+def load_training_dataset():
+    # Tugas: membaca ketujuh file di folder training ke dalam satu dict.
+    # Kunci "E0".."E3" = tabel fitur, "labels", "metadata", dan "definition" (isi JSON).
+    # Berhenti dengan pesan jelas jika ada file yang belum ada.
+
+    for name in TRAINING_FILES:
+        path  = TRAINING_DATASET_ROOT / name
+        if not path.exists():
+            raise FileNotFoundError(f"File training belum tersedia: {path}")
+
+    training = {
+        config: pd.read_csv(TRAINING_DATASET_ROOT / f"features_{config}.csv")
+        for config in CONFIG_ORDER
+    }
+
+    training["labels"] = pd.read_csv(TRAINING_DATASET_ROOT / "derived_severity_labels.csv", dtype={"run_number": "string"})
+    training["metadata"] = pd.read_csv(TRAINING_DATASET_ROOT / "case_metadata.csv", dtype={"run_number": "string"})
+
+    with (TRAINING_DATASET_ROOT / "config_definition.json").open("r", encoding="utf-8") as file:
+        training["definition"] = json.load(file)
+
+    return training
+
+
+
+def validate_training_schema(training):
+    # Tugas: memastikan bentuk tiap file sesuai yang dijanjikan.
+    #   - file fitur: kolom pertama case_id, sisanya angka, jumlahnya persis
+    #     seperti yang tercatat di config_definition.json
+    #   - file label: punya case_id dan severity
+    #   - file metadata: punya lima kolom identitas
+
+    for config in CONFIG_ORDER:
+        frame = training[config]
+        if frame.columns[0] != "case_id":
+            raise RuntimeError(f"features_{config}.csv: kolom pertama harus case_id")
+
+        non_numeric = frame.drop(columns=["case_id"]).select_dtypes(exclude="number").columns.tolist()
+        if non_numeric:
+            raise RuntimeError(f"features_{config}.csv: kolom non numerik {non_numeric[:5]}")
+
+        expected = int(training["definition"]["configurations"][config]["feature_count"])
+        if frame.shape[1] - 1 != expected:
+            raise RuntimeError(
+                f"features_{config}.csv: {frame.shape[1] - 1} fitur, config_definition menyebut {expected}"
+            )
+
+    for column in ("case_id", "severity"):
+        if column not in training["labels"].columns:
+            raise RuntimeError(f"derived_severity_labels.csv: kolom {column} tidak ada")
+
+    missing_metadata = set(CASE_METADATA_COLUMNS) - set(training["metadata"].columns)
+    if missing_metadata:
+        raise RuntimeError(f"case_metadata.csv: kolom {sorted(missing_metadata)} tidak ada /hilang ")
+
+    return True
+
+
+#11.2 Pemeriksaan Kualitas Numerik
+def validate_numeric_quality(training):
+    # Tugas: memastikan angka di file fitur layak dipakai model.
+    #   Ditolak : nilai tak hingga, kolom yang kosong seluruhnya, kolom konstan
+    #   Diizinkan: NaN pada sebagian sel (kolom yang absen di beberapa run),
+    #              tetapi jumlah dan nama kolomnya dicatat untuk laporan
+
+
+    quality = {}
+    for config in CONFIG_ORDER:
+        values = training[config].drop(columns="case_id")
+
+        inf_count = int(values.abs().eq(float("inf")).sum().sum())
+        if inf_count:
+            raise RuntimeError(f"features_{config}.csv: {inf_count} nilai tak hingga")
+
+        all_nan_columns = values.columns[values.isna().all()].tolist()
+        if all_nan_columns:
+            raise RuntimeError(f"features_{config}.csv: kolom kosong seluruhnya {all_nan_columns[:5]}")
+
+        constant_columns = [
+            c for c in values.columns if values[c].notna().all() and values[c].nunique() <= 1
+        ]
+        if constant_columns:
+            raise RuntimeError(f"features_{config}.csv: kolom konstan {constant_columns[:5]}")
+
+        quality[config] = {
+            "feature_count": int(values.shape[1]),
+            "nan_cell_count": int(values.isna().sum().sum()),
+            "columns_with_nan": values.columns[values.isna().any()].tolist(),
+        }
+
+
+    return quality
+
+
+#11.3 Pemeriksaan Konsistensi case_id
+def validate_case_consistency(training):
+    # Tugas: memastikan keenam file berbicara tentang run yang sama, dalam urutan
+    # yang sama. features_E0.csv dijadikan acuan; file lain harus identik dengannya.
+    # Juga memastikan jumlah baris cocok dengan config_definition.json dan label
+    # hanya berisi tiga kelas yang dikenal. Mengembalikan angka ringkasan untuk laporan.
+
+
+    reference = training["E0"]["case_id"].tolist()
+    if len(set(reference)) != len(reference):
+        raise RuntimeError("case_id duplikat pada features_E0.csv")
+
+    for name in (*CONFIG_ORDER, "labels", "metadata"):
+        if training[name]["case_id"].tolist() != reference:
+            raise RuntimeError(f"{name}: daftar atau urutan case_id tidak identik dengan features_E0.csv")
+
+    if len(reference) != int(training["definition"]["row_count"]):
+        raise RuntimeError("Jumlah baris tidak sama dengan config_definition.json")
+
+    if not set(training["labels"]["severity"]).issubset(SEVERITY_ORDER):
+        raise RuntimeError("Label memuat kelas severity yang tidak dikenal")
+
+    distribution = training["labels"]["severity"].value_counts().reindex(SEVERITY_ORDER, fill_value=0)
+    return {
+        "row_count": len(reference),
+        "group_count": int(training["metadata"]["scenario"].nunique()),
+        "severity_distribution": {k: int(v) for k, v in distribution.items()},
+    }
+
+
+#11.4 Audit Kebocoran Label
+def audit_leakage(training):
+    # Tugas: membuktikan tidak ada jalan bagi model untuk "mengintip" jawabannya.
+    # Tiga pemeriksaan pada setiap file fitur:
+    #   1. Tidak ada kolom terlarang (severity, service, fault_type, dll.)
+    #   2. Tidak ada fitur svc__ yang ditolak proxy audit Fase 9.5
+    #   3. Tidak ada kolom fitur yang nilainya PERSIS SAMA dengan fcw, sct, atau
+    #      severity_score di file label (salinan langsung bahan pembentuk label)
+    # Satu pelanggaran saja -> berhenti. Jika bersih, hasil lengkap dikembalikan
+    # untuk ditulis ke leakage_audit.json.
+
+    rejected = []
+    audit_path = OUTPUT_ROOT / "service_context_proxy_audit.csv"
+    if audit_path.exists():
+        proxy_audit = pd.read_csv(audit_path)
+        rejected = proxy_audit.loc[proxy_audit["decision"].eq("rejected"), "feature_name"].tolist()
+
+    labels = training["labels"].set_index("case_id")
+    results = {}
+    violations = []
+
+    for config in CONFIG_ORDER:
+        frame = training[config].set_index("case_id")
+
+        forbidden_present = [c for c in FORBIDDEN_FEATURE_COLUMNS if c in frame.columns]
+        rejected_present = [c for c in rejected if c in frame.columns]
+
+        copies = []
+        for ingredient in LABEL_INGREDIENT_COLUMNS:
+            target = labels.loc[frame.index, ingredient].astype(float)
+            for column in frame.columns:
+                if frame[column].astype(float).equals(target):
+                    copies.append(f"{column} == {ingredient}")
+
+        results[config] = {
+            "forbidden_columns_present": forbidden_present,
+            "rejected_service_context_present": rejected_present,
+            "exact_copies_of_label_ingredients": copies,
+        }
+        if forbidden_present or rejected_present or copies:
+            violations.append(config)
+
+    if violations:
+        raise RuntimeError(f"Kebocoran terdeteksi pada konfigurasi: {violations} -> {results}")
+
+    return {
+        "forbidden_columns_checked": list(FORBIDDEN_FEATURE_COLUMNS),
+        "rejected_service_context_checked": rejected,
+        "label_ingredients_checked": list(LABEL_INGREDIENT_COLUMNS),
+        "per_configuration": results,
+        "status": "clean",
+    }
+
+
+#11.5 Laporan Kesiapan dan Reproduksibilitas
+def _file_md5(path):
+    # Tugas: menghitung sidik jari (md5) satu file. Dua file dengan isi persis sama
+    # menghasilkan sidik jari sama; beda satu karakter saja sudah berbeda.
+    # Dipakai untuk membuktikan file training yang dipakai model = file yang dilaporkan.
+
+    digest = hashlib.md5()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1 << 20), b""):
+            digest.update(chunk)
+
+    return digest.hexdigest()
+
+
+def collect_excluded_runs():
+    # Tugas: mengumpulkan run yang gugur di Fase 7 dan Fase 8 beserta alasannya,
+    # supaya jawaban "kenapa 89, bukan 90" ada di satu tempat.
+
+    excluded = {}
+
+    alignment_path = OUTPUT_ROOT / "alignment_excluded_runs.csv"
+    if alignment_path.exists():
+        frame = pd.read_csv(alignment_path, dtype={"run_number": "string"})
+        excluded["phase_7_alignment"] = frame[["scenario", "run_number", "exclusion_reason"]].to_dict("records")
+
+
+    eligibility_path = OUTPUT_ROOT / "feature_eligibility.csv"
+    if eligibility_path.exists():
+        frame = pd.read_csv(eligibility_path)
+        frame["eligible"] = _parse_required_boolean(frame["eligible"], "eligible")
+        excluded["phase_8_cleaning"] = frame.loc[~frame["eligible"], ["case_id", "exclusion_reason"]].to_dict("records")
+
+    return excluded
+
+
+
+def build_readiness_report(training, quality, consistency, leakage):
+    # Tugas: menyusun satu dokumen yang merangkum SELURUH keputusan preprocessing:
+    # versi pustaka, aturan label, window, kebijakan cleaning, aturan fitur,
+    # jumlah baris/fitur, hasil audit, run yang gugur, sidik jari file training,
+    # dan file di data/processed yang tidak dikenal oleh kode saat ini.
+    # Semua nilai diambil langsung dari konstanta konfigurasi - tidak ada yang diketik ulang.
+
+
+    version = str(LABEL_POLICY["policy_version"])
+    suffix =  "" if LABEL_POLICY["is_frozen"] else f"_{version}"
+
+    expected_entries = set(EXPECTED_PROCESSED_ENTRIES) | {
+        f"derived_severity_labels{suffix}.csv",
+        f"derived_severity_distribution{suffix}.csv",
+        f"derived_severity_sensitivity_by_run{suffix}.csv",
+        f"derived_severity_sensitivity_summary{suffix}.csv",
+        f"label_policy{suffix}.json",
+    }
+
+    actual_entries = {path.name for path in OUTPUT_ROOT.iterdir()}
+
+    return {
+        "generated_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
+        "status": "READY",
+        "environment": {
+            "python": sys.version.split()[0],
+            "pandas": pd.__version__,
+            "scikit_learn": sklearn.__version__,
+        },
+        "label_policy": {
+            "version": version,
+            "status": "final" if LABEL_POLICY["is_frozen"] else "candidate",
+            "method": LABEL_POLICY["method"],
+            "fault_category": LABEL_POLICY["fault_category"],
+            "fault_category_weight": LABEL_POLICY["fault_category_weight"],
+            "service_tier": LABEL_POLICY["service_tier"],
+            "service_tier_weight": LABEL_POLICY["service_tier_weight"],
+            "severity_bins": LABEL_POLICY["severity_bins"],
+        },
+        "observation_window": {
+            "before_minutes": OBSERVATION_BEFORE_MINUTES,
+            "after_minutes": OBSERVATION_AFTER_MINUTES,
+            "interval_seconds": ALIGNMENT_INTERVAL_SECONDS,
+            "require_full_timeseries_coverage": REQUIRE_FULL_TIMESERIES_COVERAGE,
+        },
+        "cleaning_policy": {
+            "max_missing_bin_ratio": MAX_MISSING_BIN_RATIO,
+            "max_edge_fill_bins": MAX_EDGE_FILL_BINS,
+            "min_gauge_column_coverage": MIN_GAUGE_COLUMN_COVERAGE,
+            "fill_policy": FILL_POLICY,
+            "log_template_categories": {
+                name: pattern.pattern for name, pattern in LOG_TEMPLATE_CATEGORIES
+            },
+        },
+        "feature_extraction": {
+            "statistics": list(FEATURE_STATISTICS),
+            "zscore_cap": ZSCORE_CAP,
+            "include_service_context": INCLUDE_SERVICE_CONTEXT,
+            "service_anomaly_zscore_threshold": SERVICE_ANOMALY_ZSCORE_THRESHOLD,
+            "service_anomaly_ratio_threshold": SERVICE_ANOMALY_RATIO_THRESHOLD,
+            "call_volume_drop_threshold": CALL_VOLUME_DROP_THRESHOLD,
+            "proxy_audit_max_tier_accuracy": PROXY_AUDIT_MAX_TIER_ACCURACY,
+            "proxy_audit_min_within_variance_ratio": PROXY_AUDIT_MIN_WITHIN_VARIANCE_RATIO,
+        },
+        "dataset": {
+            **consistency,
+            "configurations": training["definition"]["configurations"],
+            "labels_without_features": training["definition"].get("labels_without_features", []),
+        },
+        "numeric_quality": quality,
+        "leakage_audit": leakage,
+        "excluded_runs": collect_excluded_runs(),
+        "training_files": {
+            name: {
+                "md5": _file_md5(TRAINING_DATASET_ROOT / name),
+                "bytes": (TRAINING_DATASET_ROOT / name).stat().st_size,
+            }
+            for name in TRAINING_FILES
+        },
+        "unexpected_files_in_processed": sorted(actual_entries - expected_entries),
+    }
+
+
+#11.6 Phase 11 Orchestrator
+def run_phase_11():
+    # Tugas: menjalankan empat pemeriksaan berurutan, lalu menulis dua dokumen bukti.
+    # Jika satu pemeriksaan gagal, program berhenti dan dokumen tidak ditulis -
+    # tidak boleh ada laporan "READY" untuk dataset yang belum lolos.
+
+    print("\n[Pipeline] Memulai Fase 11: Final validation dan classifier handoff...")
+
+    training = load_training_dataset()
+    validate_training_schema(training)
+    print("[OK] 11.1 Skema dataset training sesuai")
+
+    quality = validate_numeric_quality(training)
+    print("[OK] 11.2 Kualitas numerik: tanpa inf, tanpa kolom kosong, tanpa kolom konstan")
+
+    consistency = validate_case_consistency(training)
+    print("[OK] 11.3 case_id identik di seluruh file training")
+
+    leakage = audit_leakage(training)
+    print("[OK] 11.4 Audit kebocoran: bersih")
+
+    report = build_readiness_report(training, quality, consistency, leakage)
+
+    report_path = OUTPUT_ROOT / "preprocessing_readiness_report.json"
+    leakage_path = OUTPUT_ROOT / "leakage_audit.json"
+    with report_path.open("w", encoding="utf-8") as file:
+        json.dump(report, file, ensure_ascii=False, indent=2)
+    with leakage_path.open("w", encoding="utf-8") as file:
+        json.dump(leakage, file, ensure_ascii=False, indent=2)
+
+    print("\n========== PHASE 11 SUMMARY ==========")
+    print("Status                  :", report["status"])
+    print("Run (baris)             :", consistency["row_count"], "| group:", consistency["group_count"])
+    print("Distribusi severity     :", consistency["severity_distribution"])
+    print("Versi label             :", report["label_policy"]["version"],
+          f"({report['label_policy']['status']})")
+    print("\nFitur dan sel NaN per konfigurasi:")
+    for config in CONFIG_ORDER:
+        print(f"  {config}: {quality[config]['feature_count']:4d} fitur, NaN = {quality[config]['nan_cell_count']}")
+    print("\nRun yang dikeluarkan:")
+    for phase, rows in report["excluded_runs"].items():
+        names = [r.get("case_id") or f"{r['scenario']}-{r['run_number']}" for r in rows]
+        print(f"  {phase}: {len(rows)} {names}")
+    if report["unexpected_files_in_processed"]:
+        print("\n[PERHATIAN] File di data/processed yang tidak dihasilkan kode saat ini:")
+        for name in report["unexpected_files_in_processed"]:
+            print("  -", name)
+    print("\nReadiness report        :", report_path)
+    print("Leakage audit           :", leakage_path)
+    print("[OK] Fase 11 selesai - dataset siap diserahkan ke classifier.py")
+
+    return report
+
+
 #=====================================#
 # RUNNER FASE 1-5
 #=====================================#
 def run_phases_1_to_5():
+    
     # ===================================
     # 1. VALIDASI STRUKTUR DATASET
     # ===================================
@@ -5328,12 +5946,12 @@ def main():
     Menjalankan seluruh fase preprocessing yang
     sudah diimplementasikan secara berurutan.
 
-    Saat ini pipeline lengkap mencakup Fase 1-9.
+    Saat ini pipeline lengkap mencakup Fase 1-11.
     """
 
     print(
         "\n========== PREPROCESSING PIPELINE "
-        "FASE 1-9 =========="
+        "FASE 1-11 =========="
     )
 
     run_phases_1_to_5()
@@ -5341,16 +5959,18 @@ def main():
     run_phase_7()
     run_phase_8()
     run_phase_9()
+    run_phase_10()
+    run_phase_11()
 
     print(
-        "\n[OK] Seluruh preprocessing Fase 1-9 "
+        "\n[OK] Seluruh preprocessing Fase 1-11 "
         "selesai dijalankan"
     )
 
 
 def parse_execution_arguments():
     """
-    --phase all : menjalankan seluruh pipeline Fase 1-9
+    --phase all : menjalankan seluruh pipeline Fase 1-11
     --phase 1-5 : hanya menjalankan validasi dan audit
     --phase 6   : hanya menjalankan Derived Severity
                   dari output Fase 5 yang sudah tersimpan
@@ -5360,6 +5980,10 @@ def parse_execution_arguments():
                   dan run eligibility dari output Fase 7
     --phase 9   : hanya menjalankan feature extraction
                   dari output Fase 8
+    --phase 10  : hanya menjalankan perakitan dataset
+                  training dari output Fase 9
+    --phase 11  : hanya menjalankan pemeriksaan akhir
+                  dan readiness report dari output Fase 10
     """
 
     parser = argparse.ArgumentParser(
@@ -5377,15 +6001,19 @@ def parse_execution_arguments():
             "7",
             "8",
             "9",
+            "10",
+            "11",
         ],
         default="all",
         help=(
-            "Gunakan 'all' untuk Fase 1-9, "
+            "Gunakan 'all' untuk Fase 1-11, "
             "'1-5' untuk validasi dan audit, "
             "'6' untuk Derived Severity, "
             "'7' untuk alignment, "
-            "'8' untuk feature cleaning, atau "
-            "'9' untuk feature extraction."
+            "'8' untuk feature cleaning, "
+            "'9' untuk feature extraction, "
+            "'10' untuk perakitan dataset training, atau "
+            "'11' untuk pemeriksaan akhir."
         ),
     )
 
@@ -5407,5 +6035,9 @@ if __name__ == "__main__":
         run_phase_8()
     elif arguments.phase == "9":
         run_phase_9()
+    elif arguments.phase == "10":
+        run_phase_10()
+    elif arguments.phase == "11":
+        run_phase_11()
     else:
         main()
