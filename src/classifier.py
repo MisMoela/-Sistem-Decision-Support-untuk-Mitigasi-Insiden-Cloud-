@@ -27,7 +27,8 @@ from sklearn.pipeline import make_pipeline
 # =====================================================================
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIR = PROJECT_ROOT / "data" / "processed" / "training"
-DEFAULT_RESULTS_DIR = PROJECT_ROOT / "data" / "processed" / "results" / "classifier"
+DEFAULT_RESULTS_DIR = PROJECT_ROOT / "data" / "results" / "classifier"
+
  
 CONFIG_ORDER = ("E0", "E1", "E2", "E3")
 SEVERITY_ORDER = ["Low", "Medium", "High"]
@@ -325,8 +326,9 @@ def run(args):
             models_dir.mkdir(exist_ok=True)
             joblib.dump({"model": final_model, "feature_names": feature_names, "classes": SEVERITY_ORDER},
                         models_dir / f"rf_{config}.joblib")
- 
-        last = pd.DataFrame(by_repeat_rows).query("model == @f'RF_{config}'")
+
+        model_name = f"RF_{config}"
+        last = pd.DataFrame(by_repeat_rows).query("model == @model_name")
         print(f"[{config}] Macro-F1 {last['macro_f1'].mean():.3f} ± {last['macro_f1'].std(ddof=1):.3f} | "
               f"Recall High {last['recall_High'].mean():.3f}")
  
