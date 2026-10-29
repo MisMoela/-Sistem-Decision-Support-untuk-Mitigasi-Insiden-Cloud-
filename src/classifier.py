@@ -44,13 +44,49 @@ FORBIDDEN_FEATURE_COLUMNS = (
 # Hanya dipakai untuk membentuk TARGET probe dari metadata (bukan fitur).
 FAULT_CATEGORY = {
     "cpu": "resource", "mem": "resource", "disk": "resource",
-    "delay": "network", "loss": "network", "socket": "network",
+    "delay": "network", "loss": "network", "socket": "resource",
 }
  
 # RandomForest sklearn >= 1.4 menangani NaN secara native.
 SKLEARN_VERSION = tuple(int(part) for part in sklearn.__version__.split(".")[:2])
 NATIVE_NAN_SUPPORT = SKLEARN_VERSION >= (1, 4)
- 
+
+# Tujuh metrik yang tersedia seragam di kelima service  yang diijeksikan fault
+# Urutan ini menentukan urutan kolom pada matriks relatif, jadi jangan diubah
+# setelah hasil disimpan (urutan kolom mempengaruhi pemecahan simpul pada randomforest dengan random_state tetap)
+RELATIVE_METRICS = (
+    "cpu", "mem", "diskio", "socket", "latency-50", "latency-90", "workload"
+) 
+
+# Lima statistik yang sama dengan FEATURE_STATISTICS di preprocessing.py
+# Kelima nya dibutuhkan: memakai delta_mean saja menurunkan Macro-f1 sebesar 0,263
+RELATIVE_STATISTICS = ("baseline_mean", "incident_max", "delta_mean", "zscore_max", "zscore_mean")
+
+# Kategori kalimat log, sama dengan LOG_TEMPLATE_CATEGORIES di preprocessing.py.
+# currencyservice tidak punya kategori "error"; kolomnya NaN dan itu ditangani
+# RandomForest secara native.
+RELATIVE_LOG_CATEGORIES = ("error", "lifecycle", "routine")
+
+# Dua awalan kolom trace. Nama operasi berbeda antar service (checkoutservice
+# hanya PlaceOrder, productcatalogservice punya GetProduct dan ListProducts),
+# jadi tidak ada kosakata operasi bersama untuk diselaraskan. Diringkas dengan
+# MAKSIMUM atas seluruh operasi milik service terdampak: fault mengenai
+# service-nya, sehingga operasi terparah yang menjadi sinyal.
+RELATIVE_TRACE_PREFIXES = ("trace_latency", "trace_error")
+
+# Kolom yang memang global (bukan milik satu service) dipakai apa adanya,
+# tanpa penyelarasan.
+RELATIVE_GLOBAL_LOG_COLUMNS = ("log__all__new_template_count",)
+RELATIVE_GLOBAL_SVC_PREFIX = "svc__"
+
+# Modalitas yang diselaraskan untuk tiap konfigurasi, mengikuti pertingkatan
+# E0 subset E1 subset E2 subset E3 pada file fitur absolut.
+RELATIVE_CONFIG_MODALITIES = {
+    "E0": ("metric",),
+    "E1": ("metric", "log"),
+    "E2": ("metric", "log", "trace"),
+    "E3": ("metric", "log", "trace", "svc"),
+}
  
 # =====================================================================
 # 2. MEMUAT DATA
@@ -97,8 +133,122 @@ def load_features(data_dir, config, case_ids):
         raise RuntimeError(f"{config}: ada nilai tak hingga")
  
     return values, feature_columns
- 
- 
+
+
+def build_relative_specs(frame, services, modalities):
+    """
+    Menyusun resep tiap kolom relatif: (nama, {service: [kolom sumber]}, cara).
+
+    "cara" bernilai "one" bila satu kolom sumber per service, atau "max" bila
+    beberapa kolom diringkas dengan maksimum (kasus trace, karena nama operasi
+    berbeda antar service).
+
+    Kolom global (log__all__*, svc__*) tidak masuk ke sini; ia ditangani
+    terpisah sebagai kolom apa adanya.
+    """
+    specs = []
+
+    if "metric" in modalities:
+        for metric in RELATIVE_METRICS:
+            for statistic in RELATIVE_STATISTICS:
+                specs.append((
+                    f"self__{metric}__{statistic}",
+                    {s: [f"metric__{s}_{metric}__{statistic}"] for s in services},
+                    "one",
+                ))
+
+    if "log" in modalities:
+        for category in RELATIVE_LOG_CATEGORIES:
+            for statistic in RELATIVE_STATISTICS:
+                specs.append((
+                    f"self_log__{category}__{statistic}",
+                    {s: [f"log__{s}__{category}__{statistic}"] for s in services},
+                    "one",
+                ))
+        specs.append((
+            "self_log__new_template_count",
+            {s: [f"log__{s}__new_template_count"] for s in services},
+            "one",
+        ))
+
+    if "trace" in modalities:
+        for prefix in RELATIVE_TRACE_PREFIXES:
+            for statistic in RELATIVE_STATISTICS:
+                mapping = {
+                    s: [c for c in frame.columns
+                        if c.startswith(f"{prefix}__{s}_") and c.endswith(f"__{statistic}")]
+                    for s in services
+                }
+                specs.append((f"self_{prefix}__max__{statistic}", mapping, "max"))
+
+    return specs
+
+
+def collect_relative_global_columns(frame, modalities):
+    """Kolom yang memang bukan milik satu service, dipakai apa adanya."""
+    columns = []
+    if "log" in modalities:
+        columns += [c for c in RELATIVE_GLOBAL_LOG_COLUMNS if c in frame.columns]
+    if "svc" in modalities:
+        columns += [c for c in frame.columns if c.startswith(RELATIVE_GLOBAL_SVC_PREFIX)]
+    return columns
+
+
+def build_relative_lookup(frame, services, modalities=("metric",)):
+    """
+    Menyusun satu matriks fitur relatif untuk SETIAP kandidat service, dihitung
+    sekali di awal.
+
+    Keluaran:
+        lookup : array (n_service, n_run, n_fitur)
+                 lookup[i, j, k] = nilai fitur k milik service ke-i, pada run ke-j
+        names  : daftar nama kolom
+
+    Kolom global diletakkan di belakang: nilainya sama untuk semua kandidat
+    service, sehingga penyelarasan tidak mengubahnya.
+
+    Kolom yang tidak tersedia pada satu pun kandidat dibuang, dan namanya dicetak.
+
+    Alasan dihitung sekali di awal: penyusunan ulang matriks ini di dalam loop
+    fold memakai akses baris pandas memakan waktu sekitar sepuluh kali lebih
+    lama daripada pengambilan lewat indeks numpy.
+    """
+    specs = build_relative_specs(frame, services, modalities)
+    global_columns = collect_relative_global_columns(frame, modalities)
+    names = [name for name, _, _ in specs] + global_columns
+
+    lookup = np.full((len(services), len(frame), len(names)), np.nan)
+    for service_index, service in enumerate(services):
+        for spec_index, (_, mapping, how) in enumerate(specs):
+            columns = [c for c in mapping.get(service, []) if c in frame.columns]
+            if not columns:
+                continue
+            block = frame[columns].apply(pd.to_numeric, errors="coerce")
+            lookup[service_index, :, spec_index] = (
+                block.max(axis=1).to_numpy() if how == "max" else block.iloc[:, 0].to_numpy()
+            )
+        for offset, column in enumerate(global_columns):
+            lookup[service_index, :, len(specs) + offset] = (
+                pd.to_numeric(frame[column], errors="coerce").to_numpy()
+            )
+
+    kept = ~np.all(np.isnan(lookup), axis=(0, 1))
+    dropped = [name for name, keep in zip(names, kept) if not keep]
+    if dropped:
+        print(f"[REL] {len(dropped)} kolom relatif tidak tersedia, dibuang: {dropped[:5]}")
+
+    return lookup[:, :, kept], [name for name, keep in zip(names, kept) if keep]
+
+
+def take_relative(lookup, service_index):
+    """
+    Mengambil, untuk setiap run, baris dari matriks milik service yang ditunjuk
+    untuk run itu. Hasilnya array (n_run, n_fitur).
+
+    service_index[j] = indeks service yang dipakai untuk menyelaraskan run ke-j.
+    """
+    return lookup[service_index, np.arange(lookup.shape[1])]
+
 # =====================================================================
 # 3. PEMBAGIAN FOLD (dibuat sekali, disimpan, dipakai ulang)
 # =====================================================================
@@ -161,6 +311,37 @@ def make_random_forest(n_estimators, seed, n_jobs):
  
 def make_dummy(strategy, seed):
     return DummyClassifier(strategy=strategy, random_state=seed)
+
+
+def wants_fold_models(args, config):
+    """
+    True bila model tiap fold perlu disimpan untuk konfigurasi ini.
+    --save-fold-models tanpa nilai  -> semua konfigurasi yang dijalankan
+    --save-fold-models E0rel        -> hanya yang disebut
+    tidak dipakai sama sekali       -> tidak ada yang disimpan
+    """
+    if args.save_fold_models is None:
+        return False
+    return not args.save_fold_models or config in args.save_fold_models
+
+
+def make_service_locator(n_estimator, seed, n_jobs):
+    """
+    Model tahap pertama: menebak service mana yang terdampak, dari fitur absolut.
+
+    Tanpa class_weight, karena jumlah run per service sudah hampir seimbang
+    (18 run per service, kecuali checkoutservice 17 karena satu run dikecualikan
+    pada Fase 7).
+    """
+    forest = RandomForestClassifier(
+        n_estimators=n_estimator,
+        max_features="sqrt",
+        random_state=seed,
+        n_jobs=n_jobs,
+    )
+    if NATIVE_NAN_SUPPORT:
+        return forest
+    return make_pipeline(SimpleImputer(strategy="median"), forest)
  
  
 # =====================================================================
@@ -175,7 +356,7 @@ def _align_proba(model, proba, classes):
     return aligned
  
  
-def cross_validate(model_factory, X, y, splits, n_repeats, classes):
+def cross_validate(model_factory, X, y, splits, n_repeats, classes, collect = None):
     """
     Menjalankan seluruh fold. Setiap run mendapat tepat satu prediksi per repeat
     (karena tiap repeat adalah partisi lengkap). Mengembalikan:
@@ -189,12 +370,61 @@ def cross_validate(model_factory, X, y, splits, n_repeats, classes):
     for repeat, fold, train_idx, test_idx in splits:
         model = model_factory()
         model.fit(X[train_idx], y[train_idx])
+        if collect is not None:
+            collect.append({"repeat": repeat, "fold": fold, "model": model, "test_idx": test_idx})
         pred[repeat, test_idx] = model.predict(X[test_idx])
         proba[repeat, test_idx] = _align_proba(model, model.predict_proba(X[test_idx]), classes)
  
     if (pred == None).any():  # noqa: E711 - array object, perbandingan elemen
         raise RuntimeError("Ada run tanpa prediksi out-of-fold")
     return pred, proba
+
+def cross_validate_relative(X_absolute, lookup, services, service_true, y, splits, n_repeats, classes, locator_factory, model_factory, collect=None):
+    """
+    Validasi silang dua tahap, dijalankan di dalam setiap fold:
+
+      Tahap 1  Latih penebak service dari fitur ABSOLUT, hanya pada data latih
+               fold ini, lalu prediksi service untuk data uji.
+      Tahap 2  Selaraskan fitur ke service tersebut, lalu latih model severity.
+
+    Penyelarasan data latih memakai service sebenarnya; penyelarasan data uji
+    memakai service hasil prediksi. Jadi sisi uji tidak pernah menerima
+    identitas service yang sebenarnya, dan tidak ada informasi label yang bocor
+    ke sana.
+
+    Mengembalikan (pred, proba, akurasi_penebak_service).
+    """
+    n = len(y)
+    index_of = {service: i for i, service in enumerate(services)}
+    true_index = np.array([index_of[service] for service in service_true])
+
+    pred = np.empty((n_repeats, n), dtype=object)
+    proba = np.zeros((n_repeats, n, len(classes)))
+    locator_hits = []
+
+    for repeat, fold, train_idx, test_idx in splits:
+        # ---- Tahap 1: penebak service ----
+        locator = locator_factory()
+        locator.fit(X_absolute[train_idx], service_true[train_idx])
+        predicted_service = locator.predict(X_absolute[test_idx])
+        locator_hits.append(float((predicted_service == service_true[test_idx]).mean()))
+
+        # ---- Tahap 2: model severity ----
+        assignment = true_index.copy()
+        assignment[test_idx] = [index_of[service] for service in predicted_service]
+        X_relative = take_relative(lookup, assignment)
+
+        model = model_factory()
+        model.fit(X_relative[train_idx], y[train_idx])
+        if collect is not None:
+            collect.append({"repeat": repeat, "fold": fold, "locator": locator, "model": model, "test_idx": test_idx, "Xtest": X_relative[test_idx]})
+        pred[repeat, test_idx] = model.predict(X_relative[test_idx])
+        proba[repeat, test_idx] = _align_proba(model, model.predict_proba(X_relative[test_idx]), classes)
+
+    if (pred == None).any(): # noqa: E711 - array object, perbandingan elemen
+        raise RuntimeError("Ada run tanpa prediksi out-of-fold")
+
+    return pred, proba, float(np.mean(locator_hits))
  
  
 def score_predictions(y_true, y_pred, classes):
@@ -239,6 +469,10 @@ def aggregate_confusion(y, pred, classes):
 def paired_scenario_tests(scenario_acc):
     """Wilcoxon berpasangan pada akurasi per-skenario (unit = 30 skenario, bukan 89 run)."""
     pairs = [("E0", "E1"), ("E1", "E2"), ("E2", "E3"), ("E0", "E3")]
+    # Absolut versus relatif, untuk konfigurasi yang keduanya dijalankan.
+    pairs += [(config, f"{config}rel") for config in CONFIG_ORDER]
+    # Pertingkatan di sisi relatif, sejajar dengan uji E0-E3 di sisi absolut.
+    pairs += [("E0rel", "E1rel"), ("E1rel", "E2rel"), ("E2rel", "E3rel"), ("E0rel", "E3rel")]
     rows = []
     for a, b in pairs:
         if a not in scenario_acc or b not in scenario_acc:
@@ -307,9 +541,10 @@ def run(args):
         X, feature_names = load_features(data_dir, config, case_ids)
         print(f"\n[{config}] {X.shape[0]} baris x {X.shape[1]} fitur, sel kosong: {int(np.isnan(X).sum())}")
  
+        fold_models = [] if wants_fold_models(args, config) else None
         pred, proba = cross_validate(
             lambda: make_random_forest(args.trees, args.seed, args.jobs),
-            X, y, splits, args.repeats, SEVERITY_ORDER,
+            X, y, splits, args.repeats, SEVERITY_ORDER, collect=fold_models,
         )
         by_repeat_rows += metrics_by_repeat(f"RF_{config}", y, pred, SEVERITY_ORDER)
         scenario_acc[config] = per_scenario_accuracy(y, pred, groups)
@@ -327,10 +562,111 @@ def run(args):
             joblib.dump({"model": final_model, "feature_names": feature_names, "classes": SEVERITY_ORDER},
                         models_dir / f"rf_{config}.joblib")
 
+        if fold_models is not None:
+            models_dir = results_dir / "models"
+            models_dir.mkdir(exist_ok=True)
+            joblib.dump({"folds": fold_models, "feature_names": feature_names,
+                         "classes": SEVERITY_ORDER},
+                        models_dir / f"folds_{config}.joblib")
+
         model_name = f"RF_{config}"
         last = pd.DataFrame(by_repeat_rows).query("model == @model_name")
         print(f"[{config}] Macro-F1 {last['macro_f1'].mean():.3f} ± {last['macro_f1'].std(ddof=1):.3f} | "
               f"Recall High {last['recall_High'].mean():.3f}")
+
+    # ---- Random Forest dengan fitur relatif (penyelarasan ke service terdampak) ----
+    if args.relative:
+        services = sorted(set(meta["service"]))
+        service_true = meta["service"].to_numpy(dtype=object)
+
+        for source in args.relative_configs:
+            frame = pd.read_csv(data_dir / f"features_{source}.csv")
+            if not frame["case_id"].equals(case_ids):
+                raise RuntimeError(f"features_{source}.csv: urutan case_id berbeda dari label")
+
+            modalities = RELATIVE_CONFIG_MODALITIES[source]
+            lookup, relative_names = build_relative_lookup(frame, services, modalities)
+            X_absolute, _ = load_features(data_dir, source, case_ids)
+
+            config = f"{source}rel"
+            print(f"\n[{config}] {lookup.shape[1]} baris x {lookup.shape[2]} fitur relatif "
+                  f"(disarikan dari {X_absolute.shape[1]} fitur absolut, "
+                  f"{len(services)} kandidat service, modalitas {'+'.join(modalities)})")
+
+            fold_models = [] if wants_fold_models(args, config) else None
+            pred, proba, locator_accuracy = cross_validate_relative(
+                X_absolute, lookup, services, service_true, y, splits, args.repeats,
+                SEVERITY_ORDER,
+                lambda: make_service_locator(args.trees, args.seed, args.jobs),
+                lambda: make_random_forest(args.trees, args.seed, args.jobs),
+                collect=fold_models,
+            )
+
+            by_repeat_rows += metrics_by_repeat(f"RF_{config}", y, pred, SEVERITY_ORDER)
+            scenario_acc[config] = per_scenario_accuracy(y, pred, groups)
+            confusion[config] = aggregate_confusion(y, pred, SEVERITY_ORDER)
+            confusion[config].to_csv(results_dir / f"confusion_{config}.csv")
+            save_oof(results_dir, config, case_ids, y, pred, proba, SEVERITY_ORDER)
+            pd.Series(relative_names, name="feature_name").to_csv(
+                results_dir / f"feature_names_{config}.csv", index=False
+            )
+
+            models_dir = results_dir / "models"
+            models_dir.mkdir(exist_ok=True)
+
+            if fold_models is not None:
+                # Dipakai explainer.py: tiap kasus dijelaskan oleh model yang
+                # TIDAK pernah melihat kasus itu saat latihan.
+                joblib.dump(
+                    {"folds": fold_models, "feature_names": relative_names,
+                     "services": services, "classes": SEVERITY_ORDER},
+                    models_dir / f"folds_{config}.joblib",
+                )
+
+            if not args.no_save_models:
+                # Model akhir dua tahap, untuk kasus BARU. Bukan untuk menjelaskan
+                # 89 run yang ada, karena dilatih pada seluruh data.
+                index_of = {service: i for i, service in enumerate(services)}
+                true_index = np.array([index_of[service] for service in service_true])
+                locator_final = make_service_locator(args.trees, args.seed, args.jobs)
+                locator_final.fit(X_absolute, service_true)
+                severity_final = make_random_forest(args.trees, args.seed, args.jobs)
+                severity_final.fit(take_relative(lookup, true_index), y)
+                joblib.dump(
+                    {"locator": locator_final, "model": severity_final,
+                     "feature_names": relative_names, "services": services,
+                     "classes": SEVERITY_ORDER},
+                    models_dir / f"rf_{config}.joblib",
+                )
+
+            if args.probe_config:
+                # Probe yang sama seperti versi absolut, tetapi lewat jalur relatif.
+                # Hasilnya berdampingan di metrics_summary.csv untuk dibandingkan.
+                target = meta["fault_type"].map(FAULT_CATEGORY).to_numpy(dtype=object)
+                probe_classes = sorted(set(target))
+                probe_pred, _, _ = cross_validate_relative(
+                    X_absolute, lookup, services, service_true, target, splits,
+                    args.repeats, probe_classes,
+                    lambda: make_service_locator(args.trees, args.seed, args.jobs),
+                    lambda: make_random_forest(args.trees, args.seed, args.jobs),
+                )
+                for repeat in range(probe_pred.shape[0]):
+                    by_repeat_rows.append({
+                        "model": f"probe_fault_category_{config}", "repeat": repeat,
+                        "accuracy": accuracy_score(target, probe_pred[repeat]),
+                        "balanced_accuracy": balanced_accuracy_score(target, probe_pred[repeat]),
+                        "macro_f1": f1_score(target, probe_pred[repeat],
+                                             average="macro", zero_division=0),
+                    })
+
+            model_name = f"RF_{config}"
+            last = pd.DataFrame(by_repeat_rows).query("model == @model_name")
+            print(f"[{config}] Penebak service: {locator_accuracy:.3f} "
+                  f"(rata-rata {len(splits)} fold)")
+            print(f"[{config}] Macro-F1 {last['macro_f1'].mean():.3f} ± "
+                  f"{last['macro_f1'].std(ddof=1):.3f} | "
+                  f"Recall High {last['recall_High'].mean():.3f}")
+
  
     # ---- Probe: seberapa jauh telemetri mengenali service & kategori fault ----
     if args.probe_config:
@@ -373,6 +709,16 @@ def run(args):
             "n_splits": args.splits, "n_repeats": args.repeats, "seed": args.seed,
             "n_trees": args.trees, "class_weight": "balanced_subsample",
             "primary_metric": PRIMARY_METRIC, "configs": list(args.configs),
+            "relative_features": bool(args.relative),
+            "relative_configs": list(args.relative_configs) if args.relative else None,
+            "relative_metrics": list(RELATIVE_METRICS) if args.relative else None,
+            "relative_statistics": list(RELATIVE_STATISTICS) if args.relative else None,
+            "relative_log_categories": list(RELATIVE_LOG_CATEGORIES) if args.relative else None,
+            "relative_trace_aggregation": "max_over_service_operations" if args.relative else None,
+            "relative_modalities": (
+                {c: list(RELATIVE_CONFIG_MODALITIES[c]) for c in args.relative_configs}
+                if args.relative else None
+            ),
         }, file, ensure_ascii=False, indent=2)
  
     pd.set_option("display.width", 200)
@@ -402,9 +748,41 @@ def parse_arguments():
     parser.add_argument("--probe-config", default="E0", choices=[*CONFIG_ORDER, ""],
                         help="konfigurasi untuk probe service/kategori fault; kosong = lewati")
     parser.add_argument("--no-save-models", action="store_true")
+    parser.add_argument("--save-fold-models", nargs="*", default=None,
+                        metavar="CONFIG",
+                        help="simpan model tiap fold (dibutuhkan explainer.py). "
+                             "Sebutkan konfigurasinya, mis. --save-fold-models E0rel. "
+                             "Tanpa nilai = semua yang dijalankan (ukurannya besar).")
+    parser.add_argument("--relative", action="store_true",
+                        help="jalankan juga model dengan fitur relatif "
+                             "(penyelarasan ke service terdampak, dua tahap)")
+    parser.add_argument("--relative-configs", nargs="+", default=list(CONFIG_ORDER),
+                        choices=CONFIG_ORDER,
+                        help="konfigurasi mana yang dijalankan versi relatifnya")
     return parser.parse_args()
  
  
-if __name__ == "__main__":
+def silence_known_warnings():
+    """
+    Membungkam dua peringatan yang sudah diketahui dan tidak mempengaruhi hasil.
+
+    Yang kedua adalah keluhan sklearn 1.9 tentang dirinya sendiri: modul ensemble
+    memanggil joblib lewat utils.parallel, dan utils.parallel mengeluhkan cara
+    pemanggilan itu. Muncul sekali per pohon, sehingga pada run penuh jumlahnya
+    ratusan ribu baris (log run sebelumnya 53 MB) dan penulisannya ke konsol
+    ikut memperlambat eksekusi.
+
+    Disaring lewat pola pesan, bukan seluruh UserWarning, supaya peringatan lain
+    yang mungkin penting tetap terlihat.
+    """
     warnings.filterwarnings("ignore", category=FutureWarning)
+    warnings.filterwarnings(
+        "ignore",
+        message=r"`sklearn\.utils\.parallel\.delayed` should be used with",
+        category=UserWarning,
+    )
+
+
+if __name__ == "__main__":
+    silence_known_warnings()
     run(parse_arguments())

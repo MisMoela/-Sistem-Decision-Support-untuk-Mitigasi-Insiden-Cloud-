@@ -41,7 +41,7 @@ TRACE_CHUNK_SIZE = 100_000
 
 LABEL_POLICY = {
     # Naikkan policy_version dan set is_frozen=True setelah tabel disepakati
-    "policy_version": "fcw_sct_v1",
+    "policy_version": "fcw_sct_v2",
     "is_frozen": False,
     "method": "fcw_x_sct",
 
@@ -54,7 +54,9 @@ LABEL_POLICY = {
         "disk": "resource",
         "delay": "network",
         "loss": "network",
-        "socket": "network",
+        # socket diinjeksi lewat stress-ng, sama seperti cpu/mem/disk
+        # (RCAEval 3.2); tc hanya dipakai untuk delay dan loss.
+        "socket": "resource",
     },
     "fault_category_weight": {
         "resource": 1,
